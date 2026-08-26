@@ -6,8 +6,12 @@ trading through Alpaca (paper or live).
 
 ## Status
 
-Phase 1: project scaffolding. Modules are stubs only — no trading logic is
-implemented yet.
+Phases 1-7 implemented: feature engineering, the HMM regime engine,
+volatility-bucketed allocation strategies, risk management, Alpaca broker
+integration, walk-forward backtesting/performance/stress-testing, and the
+live/paper trading orchestration loop in `main.py`. `monitoring/` (logging,
+terminal dashboard, alerts) remains stubs — `main.py` uses the standard
+`logging` module and a `rich`-based status view directly instead.
 
 ## Project layout
 
@@ -17,10 +21,10 @@ regime-trader/
 ├── core/            # HMM engine, regime strategies, risk manager, signal generator
 ├── broker/          # Alpaca client, order executor, position tracker
 ├── data/            # Market data fetching, feature engineering
-├── monitoring/       # Logging, terminal dashboard, alerts
+├── monitoring/       # Logging, terminal dashboard, alerts (stubs)
 ├── backtest/        # Walk-forward backtester, performance analytics, stress tests
 ├── tests/           # Unit tests
-└── main.py          # Entry point
+└── main.py          # Entry point (backtest / run / train-only / dashboard)
 ```
 
 ## Setup
@@ -39,5 +43,15 @@ regime-trader/
 ## Usage
 
 ```
-python main.py
+# Walk-forward backtest (optionally against local CSVs with --data-dir)
+python main.py backtest --symbols SPY --start 2019-01-01 --end 2024-12-31 [--compare] [--stress-test]
+
+# Train (or retrain) the HMM for each symbol and exit
+python main.py train-only [--symbols SPY ...]
+
+# Start the live/paper trading loop (requires ALPACA_API_KEY/ALPACA_SECRET_KEY in .env)
+python main.py run [--dry-run]
+
+# Check on a running (or previously run) instance
+python main.py dashboard
 ```

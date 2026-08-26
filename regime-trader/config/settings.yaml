@@ -14,7 +14,17 @@ broker:
     - META
     - TSLA
     - AMD
-  timeframe: 1Day               # Bar timeframe for data/signals
+  timeframe: 1Day               # Bar timeframe used for HMM training/regime decisions
+
+live:
+  bar_timeframe: 5Min            # Bar timeframe the live loop wakes up on for
+                                  # housekeeping (stops, circuit breakers, dashboard);
+                                  # regime/signal decisions still use broker.timeframe
+  model_stale_days: 7            # Retrain the HMM if the saved model is older than this
+  model_dir: models              # Where per-symbol HMM models are pickled
+  state_snapshot_path: state_snapshot.json  # Crash-recovery / dashboard state file
+  lock_file_path: trading_halted.lock       # Peak-drawdown circuit breaker lock file
+  max_market_wait_seconds: 3600  # Cap on how long startup waits for the market to open
 
 hmm:
   n_candidates: [3, 4, 5, 6, 7]  # Candidate number of hidden states to evaluate
