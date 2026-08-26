@@ -1,0 +1,56 @@
+# regime-trader
+
+An HMM regime-based trading bot: detects market volatility/trend regimes
+with a Gaussian Hidden Markov Model and allocates a portfolio accordingly,
+trading through Alpaca (paper or live).
+
+## Status
+
+Phases 1-8 implemented: feature engineering, the HMM regime engine,
+volatility-bucketed allocation strategies, risk management, Alpaca broker
+integration, walk-forward backtesting/performance/stress-testing, the
+live/paper trading orchestration loop, and structured logging/alerts/
+terminal dashboard in `monitoring/`, all wired into `main.py`.
+
+## Project layout
+
+```
+regime-trader/
+├── config/          # settings.yaml, credentials.yaml.example
+├── core/            # HMM engine, regime strategies, risk manager, signal generator
+├── broker/          # Alpaca client, order executor, position tracker
+├── data/            # Market data fetching, feature engineering
+├── monitoring/       # Structured JSON logging, terminal dashboard, alerts
+├── backtest/        # Walk-forward backtester, performance analytics, stress tests
+├── tests/           # Unit tests
+└── main.py          # Entry point (backtest / run / train-only / dashboard)
+```
+
+## Setup
+
+1. Create a virtual environment and install dependencies:
+   ```
+   python -m venv venv
+   source venv/bin/activate
+   pip install -r requirements.txt
+   ```
+2. Copy `.env.example` to `.env` and fill in your Alpaca API credentials.
+3. Copy `config/credentials.yaml.example` to `config/credentials.yaml` and
+   fill in real values (this file is gitignored).
+4. Review and adjust `config/settings.yaml` for your desired parameters.
+
+## Usage
+
+```
+# Walk-forward backtest (optionally against local CSVs with --data-dir)
+python main.py backtest --symbols SPY --start 2019-01-01 --end 2024-12-31 [--compare] [--stress-test]
+
+# Train (or retrain) the HMM for each symbol and exit
+python main.py train-only [--symbols SPY ...]
+
+# Start the live/paper trading loop (requires ALPACA_API_KEY/ALPACA_SECRET_KEY in .env)
+python main.py run [--dry-run]
+
+# Check on a running (or previously run) instance
+python main.py dashboard
+```

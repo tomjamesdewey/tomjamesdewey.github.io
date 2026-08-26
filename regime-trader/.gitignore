@@ -1,0 +1,21 @@
+# Secrets
+.env
+config/credentials.yaml
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# OS
+.DS_Store
+
+# Runtime artifacts
+logs/
+models/
+state_snapshot.json
+trading_halted.lock
+backtest_output/
