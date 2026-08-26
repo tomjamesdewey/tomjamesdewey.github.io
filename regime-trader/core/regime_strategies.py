@@ -154,6 +154,7 @@ class BaseStrategy(ABC):
             timestamp=regime_state.timestamp,
             reasoning=reasoning,
             strategy_name=self.strategy_name,
+            metadata={"regime_max_position_size_pct": self.regime_info.max_position_size_pct},
         )
 
 

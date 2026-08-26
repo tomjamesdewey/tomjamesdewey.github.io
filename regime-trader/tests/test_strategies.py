@@ -215,7 +215,7 @@ def test_no_uncertainty_when_confident_and_stable() -> None:
     assert len(signals) == 1
     assert signals[0].position_size_pct == CONFIG.low_vol_allocation
     assert "[UNCERTAINTY" not in signals[0].reasoning
-    assert signals[0].metadata == {}
+    assert "uncertainty_mode" not in signals[0].metadata
 
 
 def test_rebalance_threshold_suppresses_small_drift() -> None:
