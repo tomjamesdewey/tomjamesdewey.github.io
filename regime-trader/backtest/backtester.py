@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 import pandas as pd
 
 from core.hmm_engine import HMMEngine
-from core.regime_strategies import RegimeStrategy
+from core.regime_strategies import StrategyOrchestrator
 from core.risk_manager import RiskManager
 
 
@@ -31,7 +31,7 @@ class Backtester:
     def __init__(
         self,
         hmm_engine: HMMEngine,
-        strategy: RegimeStrategy,
+        strategy: StrategyOrchestrator,
         risk_manager: RiskManager,
         initial_capital: float,
         slippage_pct: float,

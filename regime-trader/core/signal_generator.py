@@ -10,7 +10,7 @@ from enum import Enum
 import pandas as pd
 
 from core.hmm_engine import HMMEngine
-from core.regime_strategies import RegimeStrategy
+from core.regime_strategies import StrategyOrchestrator
 from core.risk_manager import RiskManager
 
 
@@ -40,7 +40,7 @@ class SignalGenerator:
     def __init__(
         self,
         hmm_engine: HMMEngine,
-        strategy: RegimeStrategy,
+        strategy: StrategyOrchestrator,
         risk_manager: RiskManager,
     ) -> None:
         """Store references to the HMM engine, strategy, and risk manager."""
