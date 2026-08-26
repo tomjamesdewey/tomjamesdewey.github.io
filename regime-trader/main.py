@@ -117,7 +117,7 @@ def _load_price_data_from_alpaca(
 ) -> dict[str, pd.DataFrame]:
     """Fetch historical bars from Alpaca via broker.alpaca_client /
     data.market_data. Requires ALPACA_API_KEY/ALPACA_SECRET_KEY (see
-    .env.example) and that those modules' fetch methods are implemented.
+    .env.example) and network access to Alpaca.
     """
     from broker.alpaca_client import AlpacaClient
     from data.market_data import MarketDataClient
@@ -143,9 +143,9 @@ def _load_price_data_from_alpaca(
         )
         if not isinstance(bars, pd.DataFrame) or bars.empty:
             raise RuntimeError(
-                "data.market_data.MarketDataClient.get_historical_bars() did not "
-                "return data — that class is not implemented yet in this phase. "
-                "Pass --data-dir to backtest against local CSV files instead."
+                f"Alpaca returned no bars for {symbol} between {start} and {end}. "
+                "Check the symbol and date range, or pass --data-dir to backtest "
+                "against local CSV files instead."
             )
         price_data[symbol] = bars
     return price_data

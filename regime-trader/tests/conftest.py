@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -9,6 +11,30 @@ import pytest
 from core.hmm_engine import HMMEngine
 from core.regime_strategies import StrategyConfig, StrategyOrchestrator
 from data.feature_engineering import FeatureEngineer
+
+
+def make_mocked_alpaca_client(monkeypatch, equity: str = "100000", cash: str = "50000", buying_power: str = "80000"):
+    """An AlpacaClient with TradingClient/StockHistoricalDataClient replaced
+    by MagicMocks (so no network call ever happens), pre-wired with a
+    healthy get_clock response (needed for the constructor's health
+    check) and a default get_account response.
+    """
+    import broker.alpaca_client as alpaca_client_module
+
+    monkeypatch.setattr(alpaca_client_module, "TradingClient", MagicMock())
+    monkeypatch.setattr(alpaca_client_module, "StockHistoricalDataClient", MagicMock())
+
+    client = alpaca_client_module.AlpacaClient("test-key", "test-secret", paper=True)
+
+    healthy_clock = MagicMock()
+    healthy_clock.model_dump.return_value = {"is_open": True}
+    client.trading_client.get_clock.return_value = healthy_clock
+
+    account = MagicMock()
+    account.model_dump.return_value = {"equity": equity, "cash": cash, "buying_power": buying_power}
+    client.trading_client.get_account.return_value = account
+
+    return client
 
 # Kept small so HMM fitting stays fast in tests; still >= a full
 # standardization window (252) + SMA-200 warm-up so build_feature_set
