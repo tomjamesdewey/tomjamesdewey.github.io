@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -11,6 +12,23 @@ import pytest
 from core.hmm_engine import HMMEngine
 from core.regime_strategies import StrategyConfig, StrategyOrchestrator
 from data.feature_engineering import FeatureEngineer
+
+
+@pytest.fixture(autouse=True)
+def _reset_regime_trader_loggers():
+    """logging.getLogger caches loggers globally by name. monitoring.logger's
+    "regime_trader.{main,trades,alerts,regime}" loggers are shared across
+    every test that constructs a StructuredLogger, so without this, a
+    handler configured for one test's tmp_path (and thus one test's log
+    files) would leak into every later test that logs through the same
+    logger name — including writing lines into files earlier tests then
+    assert on the exact contents of."""
+    yield
+    for name in ("main", "trades", "alerts", "regime"):
+        logger = logging.getLogger(f"regime_trader.{name}")
+        for handler in logger.handlers[:]:
+            handler.close()
+            logger.removeHandler(handler)
 
 
 def make_mocked_alpaca_client(monkeypatch, equity: str = "100000", cash: str = "50000", buying_power: str = "80000"):

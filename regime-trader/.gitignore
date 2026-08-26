@@ -12,3 +12,10 @@ venv/
 
 # OS
 .DS_Store
+
+# Runtime artifacts
+logs/
+models/
+state_snapshot.json
+trading_halted.lock
+backtest_output/

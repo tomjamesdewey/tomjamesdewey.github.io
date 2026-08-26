@@ -31,6 +31,7 @@ def make_config(tmp_path, **overrides) -> dict:
     config["live"]["state_snapshot_path"] = str(tmp_path / "state_snapshot.json")
     config["live"]["lock_file_path"] = str(tmp_path / "trading_halted.lock")
     config["live"]["max_market_wait_seconds"] = 60
+    config["monitoring"]["log_dir"] = str(tmp_path / "logs")
     for section, values in overrides.items():
         config[section].update(values)
     return config
@@ -53,7 +54,7 @@ def make_daily_bars(n: int = 900, seed: int = 3, end: datetime | None = None) ->
     )
 
 
-def make_session(monkeypatch, tmp_path, symbols=("TEST",), dry_run=False, config=None):
+def make_session(monkeypatch, tmp_path, symbols=("TEST",), dry_run=False, config=None, alert_manager=None):
     config = config or make_config(tmp_path)
     client = make_mocked_alpaca_client(monkeypatch)
     open_clock = MagicMock()
@@ -68,7 +69,15 @@ def make_session(monkeypatch, tmp_path, symbols=("TEST",), dry_run=False, config
     position_tracker = PositionTracker(client, circuit_breaker=risk_manager.circuit_breaker)
 
     session = main_module.TradingSession(
-        config, client, market_data, order_executor, position_tracker, risk_manager, list(symbols), dry_run=dry_run
+        config,
+        client,
+        market_data,
+        order_executor,
+        position_tracker,
+        risk_manager,
+        list(symbols),
+        dry_run=dry_run,
+        alert_manager=alert_manager,
     )
     return session
 
@@ -545,3 +554,265 @@ def test_build_trading_session_requires_credentials(monkeypatch, tmp_path) -> No
 
     with pytest.raises(RuntimeError):
         main_module.build_trading_session(config, ["TEST"])
+
+
+# ----------------------------------------------------------------------
+# Phase 8: monitoring/alerts integration
+# ----------------------------------------------------------------------
+
+
+def test_process_signal_approved_logs_trade(monkeypatch, tmp_path) -> None:
+    session = make_session(monkeypatch, tmp_path)
+    session.structured_logger = MagicMock()
+    session.order_executor.submit_bracket_order.return_value = MagicMock(status="new")
+
+    session.process_signal("TEST", make_signal())
+
+    session.structured_logger.log_trade.assert_called_once()
+    symbol_arg, direction_arg, details = session.structured_logger.log_trade.call_args[0]
+    assert symbol_arg == "TEST"
+    assert direction_arg == "LONG"
+    assert "trade_id" in details
+
+
+def test_process_signal_records_signal_on_dashboard(monkeypatch, tmp_path) -> None:
+    session = make_session(monkeypatch, tmp_path)
+    session.order_executor.submit_bracket_order.return_value = MagicMock(status="new")
+
+    session.process_signal("TEST", make_signal())
+
+    assert len(session.dashboard.recent_signals) == 1
+    assert session.dashboard.recent_signals[0]["symbol"] == "TEST"
+
+
+def test_process_signal_data_feed_down_alerts_once(monkeypatch, tmp_path) -> None:
+    mock_alerts = MagicMock()
+    session = make_session(monkeypatch, tmp_path, alert_manager=mock_alerts)
+    session._last_bar_at["TEST"] = datetime.now(timezone.utc) - timedelta(hours=1)
+
+    session.process_signal("TEST", make_signal())
+    session.process_signal("TEST", make_signal())  # still stale, should not re-alert
+
+    mock_alerts.alert_data_feed_down.assert_called_once_with("TEST")
+
+
+def test_process_signal_data_feed_recovers_allows_realert_later(monkeypatch, tmp_path) -> None:
+    mock_alerts = MagicMock()
+    session = make_session(monkeypatch, tmp_path, alert_manager=mock_alerts)
+    session._last_bar_at["TEST"] = datetime.now(timezone.utc) - timedelta(hours=1)
+    session.process_signal("TEST", make_signal())
+    assert "TEST" in session._data_feed_alerted
+
+    session._last_bar_at["TEST"] = datetime.now(timezone.utc)  # feed recovers
+    session.order_executor.submit_bracket_order.return_value = MagicMock(status="new")
+    session.process_signal("TEST", make_signal())
+
+    assert "TEST" not in session._data_feed_alerted
+
+
+def test_process_new_trading_day_alerts_on_regime_change(monkeypatch, tmp_path) -> None:
+    from core.hmm_engine import RegimeState
+
+    mock_alerts = MagicMock()
+    session = make_session(monkeypatch, tmp_path, alert_manager=mock_alerts)
+    assert session.startup() is True
+
+    session._last_regime_state["TEST"] = RegimeState(
+        label="BEAR", state_id=1, probability=0.9, state_probabilities={}, timestamp=datetime.now(timezone.utc),
+        is_confirmed=True, consecutive_bars=5,
+    )
+    fake_bull_state = RegimeState(
+        label="BULL", state_id=0, probability=0.9, state_probabilities={}, timestamp=datetime.now(timezone.utc),
+        is_confirmed=True, consecutive_bars=3,
+    )
+    session.engines["TEST"].predict_regime_filtered = MagicMock(return_value=[fake_bull_state])
+    session.engines["TEST"].is_flickering = MagicMock(return_value=False)
+
+    session._process_new_trading_day("TEST")
+
+    mock_alerts.alert_regime_change.assert_called_once_with("TEST", "BEAR", "BULL")
+
+
+def test_process_new_trading_day_no_alert_when_regime_unchanged(monkeypatch, tmp_path) -> None:
+    from core.hmm_engine import RegimeState
+
+    mock_alerts = MagicMock()
+    session = make_session(monkeypatch, tmp_path, alert_manager=mock_alerts)
+    assert session.startup() is True
+
+    same_state = RegimeState(
+        label="BULL", state_id=0, probability=0.9, state_probabilities={}, timestamp=datetime.now(timezone.utc),
+        is_confirmed=True, consecutive_bars=3,
+    )
+    session._last_regime_state["TEST"] = same_state
+    session.engines["TEST"].predict_regime_filtered = MagicMock(return_value=[same_state])
+    session.engines["TEST"].is_flickering = MagicMock(return_value=False)
+
+    session._process_new_trading_day("TEST")
+
+    assert not mock_alerts.alert_regime_change.called
+
+
+def test_process_new_trading_day_alerts_on_flicker(monkeypatch, tmp_path) -> None:
+    from core.hmm_engine import RegimeState
+
+    mock_alerts = MagicMock()
+    session = make_session(monkeypatch, tmp_path, alert_manager=mock_alerts)
+    assert session.startup() is True
+
+    state = RegimeState(
+        label="BULL", state_id=0, probability=0.9, state_probabilities={}, timestamp=datetime.now(timezone.utc),
+        is_confirmed=True, consecutive_bars=3,
+    )
+    session.engines["TEST"].predict_regime_filtered = MagicMock(return_value=[state])
+    session.engines["TEST"].is_flickering = MagicMock(return_value=True)
+    session.engines["TEST"].get_regime_flicker_rate = MagicMock(return_value=6)
+    session.engines["TEST"].flicker_threshold = 4
+
+    session._process_new_trading_day("TEST")
+
+    mock_alerts.alert_flicker_exceeded.assert_called_once_with("TEST", 6, 4)
+
+
+def test_train_and_save_hmm_alerts_and_logs(monkeypatch, tmp_path) -> None:
+    mock_alerts = MagicMock()
+    session = make_session(monkeypatch, tmp_path, alert_manager=mock_alerts)
+    session.structured_logger = MagicMock()
+    bars = make_daily_bars()
+
+    engine = session._train_and_save_hmm("TEST", bars)
+
+    mock_alerts.alert_hmm_retrained.assert_called_once_with("TEST", engine.n_regimes)
+    session.structured_logger.log_info.assert_called_once()
+
+
+def test_check_circuit_breakers_alerts_with_breaker_type(monkeypatch, tmp_path) -> None:
+    mock_alerts = MagicMock()
+    session = make_session(monkeypatch, tmp_path, alert_manager=mock_alerts)
+    session.client.trading_client.get_account.return_value.model_dump.return_value = {
+        "equity": "96000", "cash": "96000", "buying_power": "96000",
+    }
+    session.position_tracker._daily_start_equity = 100_000.0
+
+    session.check_circuit_breakers("TEST")
+
+    calls = [c.args[0] for c in mock_alerts.alert_circuit_breaker.call_args_list]
+    assert "daily_reduce" in calls
+    assert "daily_halt" in calls
+
+
+def test_check_circuit_breakers_does_not_realert_when_already_active(monkeypatch, tmp_path) -> None:
+    mock_alerts = MagicMock()
+    session = make_session(monkeypatch, tmp_path, alert_manager=mock_alerts)
+    session.client.trading_client.get_account.return_value.model_dump.return_value = {
+        "equity": "96000", "cash": "96000", "buying_power": "96000",
+    }
+    session.position_tracker._daily_start_equity = 100_000.0
+    session.check_circuit_breakers("TEST")
+    mock_alerts.reset_mock()
+
+    session.check_circuit_breakers("TEST")
+
+    assert not mock_alerts.alert_circuit_breaker.called
+
+
+def test_check_large_pnl_alerts_above_threshold(monkeypatch, tmp_path) -> None:
+    mock_alerts = MagicMock()
+    session = make_session(monkeypatch, tmp_path, alert_manager=mock_alerts)
+    session.large_pnl_threshold_pct = 0.05
+    session.position_tracker.register_entry("TEST", 10, 100.0)
+    session.position_tracker.get_position("TEST").current_price = 110.0  # +10%, above 5% threshold
+
+    session._check_large_pnl("TEST")
+
+    mock_alerts.alert_large_pnl.assert_called_once_with("TEST", pytest.approx(0.10), 0.05)
+
+
+def test_check_large_pnl_no_alert_below_threshold(monkeypatch, tmp_path) -> None:
+    mock_alerts = MagicMock()
+    session = make_session(monkeypatch, tmp_path, alert_manager=mock_alerts)
+    session.large_pnl_threshold_pct = 0.05
+    session.position_tracker.register_entry("TEST", 10, 100.0)
+    session.position_tracker.get_position("TEST").current_price = 101.0  # +1%, below threshold
+
+    session._check_large_pnl("TEST")
+
+    assert not mock_alerts.alert_large_pnl.called
+
+
+def test_check_large_pnl_no_position_is_noop(monkeypatch, tmp_path) -> None:
+    mock_alerts = MagicMock()
+    session = make_session(monkeypatch, tmp_path, alert_manager=mock_alerts)
+
+    session._check_large_pnl("TEST")  # no position registered
+
+    assert not mock_alerts.alert_large_pnl.called
+
+
+def test_unhandled_error_sends_critical_alert(monkeypatch, tmp_path) -> None:
+    mock_alerts = MagicMock()
+    session = make_session(monkeypatch, tmp_path, alert_manager=mock_alerts)
+    assert session.startup() is True
+    session._last_regime_date["TEST"] = datetime.now(timezone.utc).date()
+    session.position_tracker.get_portfolio_state = MagicMock(side_effect=RuntimeError("catastrophic"))
+    bar = pd.Series({"open": 100, "high": 101, "low": 99, "close": 100, "volume": 1_000_000}, name=datetime.now(timezone.utc))
+
+    session.on_bar("TEST", bar)  # must not raise
+
+    mock_alerts.send_alert.assert_called_once()
+    args, kwargs = mock_alerts.send_alert.call_args
+    assert "TEST" in args[0]
+    assert kwargs["alert_key"] == "unhandled_error:TEST"
+
+
+# ----------------------------------------------------------------------
+# Phase 8: dashboard integration
+# ----------------------------------------------------------------------
+
+
+def test_build_dashboard_state_includes_all_sections(monkeypatch, tmp_path) -> None:
+    session = make_session(monkeypatch, tmp_path)
+    assert session.startup() is True
+    session.position_tracker.register_entry("TEST", 10, 100.0, stop_level=95.0, regime_at_entry="BULL")
+
+    state = session._build_dashboard_state()
+
+    assert set(state.keys()) == {"regimes", "portfolio", "positions", "risk", "system"}
+    assert len(state["positions"]) == 1
+    assert state["positions"][0]["symbol"] == "TEST"
+    assert state["system"]["mode"] == "PAPER"
+
+
+def test_build_dashboard_state_reflects_dry_run_mode(monkeypatch, tmp_path) -> None:
+    session = make_session(monkeypatch, tmp_path, dry_run=True)
+    state = session._build_dashboard_state()
+    assert state["system"]["mode"] == "DRY RUN"
+
+
+def test_check_api_health_returns_latency_on_success(monkeypatch, tmp_path) -> None:
+    session = make_session(monkeypatch, tmp_path)
+    ok, latency_ms = session._check_api_health()
+    assert ok is True
+    assert latency_ms is not None and latency_ms >= 0
+
+
+def test_check_api_health_alerts_and_returns_false_on_failure(monkeypatch, tmp_path) -> None:
+    mock_alerts = MagicMock()
+    session = make_session(monkeypatch, tmp_path, alert_manager=mock_alerts)
+    session.client.get_clock = MagicMock(side_effect=RuntimeError("connection lost"))
+
+    ok, latency_ms = session._check_api_health()
+
+    assert ok is False
+    assert latency_ms is None
+    mock_alerts.alert_api_lost.assert_called_once()
+
+
+def test_render_dashboard_uses_new_dashboard_and_does_not_raise(monkeypatch, tmp_path) -> None:
+    from rich.console import Console
+
+    session = make_session(monkeypatch, tmp_path)
+    assert session.startup() is True
+    session.position_tracker.register_entry("TEST", 10, 100.0, regime_at_entry="BULL")
+
+    session.render_dashboard(console=Console(file=open("/dev/null", "w")))  # must not raise

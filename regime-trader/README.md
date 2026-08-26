@@ -6,12 +6,11 @@ trading through Alpaca (paper or live).
 
 ## Status
 
-Phases 1-7 implemented: feature engineering, the HMM regime engine,
+Phases 1-8 implemented: feature engineering, the HMM regime engine,
 volatility-bucketed allocation strategies, risk management, Alpaca broker
-integration, walk-forward backtesting/performance/stress-testing, and the
-live/paper trading orchestration loop in `main.py`. `monitoring/` (logging,
-terminal dashboard, alerts) remains stubs — `main.py` uses the standard
-`logging` module and a `rich`-based status view directly instead.
+integration, walk-forward backtesting/performance/stress-testing, the
+live/paper trading orchestration loop, and structured logging/alerts/
+terminal dashboard in `monitoring/`, all wired into `main.py`.
 
 ## Project layout
 
@@ -21,7 +20,7 @@ regime-trader/
 ├── core/            # HMM engine, regime strategies, risk manager, signal generator
 ├── broker/          # Alpaca client, order executor, position tracker
 ├── data/            # Market data fetching, feature engineering
-├── monitoring/       # Logging, terminal dashboard, alerts (stubs)
+├── monitoring/       # Structured JSON logging, terminal dashboard, alerts
 ├── backtest/        # Walk-forward backtester, performance analytics, stress tests
 ├── tests/           # Unit tests
 └── main.py          # Entry point (backtest / run / train-only / dashboard)

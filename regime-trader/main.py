@@ -34,7 +34,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import pandas as pd
 import yaml
@@ -54,10 +54,14 @@ from core.regime_strategies import Signal as StrategySignal
 from core.risk_manager import RiskConfig, RiskManager
 from data.feature_engineering import ATR_WINDOW, FeatureEngineer, average_true_range
 from data.market_data import MarketDataClient
+from monitoring.alerts import AlertManager, AlertSeverity
+from monitoring.dashboard import Dashboard
+from monitoring.logger import StructuredLogger
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG_PATH = "config/settings.yaml"
+DEFAULT_CREDENTIALS_PATH = "config/credentials.yaml"
 REQUIRED_CSV_COLUMNS = ("open", "high", "low", "close", "volume")
 
 #: Calendar days of history fetched to (re)train/refresh a symbol's daily
@@ -75,6 +79,17 @@ def load_config(config_path: str = DEFAULT_CONFIG_PATH) -> dict:
     """Load and parse settings.yaml into a configuration dict."""
     with open(config_path) as f:
         return yaml.safe_load(f)
+
+
+def load_credentials(path: str = DEFAULT_CREDENTIALS_PATH) -> dict:
+    """Load config/credentials.yaml (gitignored) for optional alert
+    email/webhook settings. Returns {} gracefully if the file is missing —
+    email/webhook alert delivery is optional."""
+    credentials_path = Path(path)
+    if not credentials_path.exists():
+        return {}
+    with open(credentials_path) as f:
+        return yaml.safe_load(f) or {}
 
 
 def build_hmm_template(config: dict) -> HMMEngine:
@@ -266,6 +281,9 @@ class TradingSession:
         risk_manager: RiskManager,
         symbols: list[str],
         dry_run: bool = False,
+        structured_logger: Optional[StructuredLogger] = None,
+        alert_manager: Optional[AlertManager] = None,
+        dashboard: Optional[Dashboard] = None,
     ) -> None:
         self.config = config
         self.client = client
@@ -277,14 +295,20 @@ class TradingSession:
         self.dry_run = dry_run
 
         live_cfg = config["live"]
+        monitoring_cfg = config["monitoring"]
         self.timeframe = config["broker"]["timeframe"]
         self.live_bar_timeframe = live_cfg["bar_timeframe"]
         self.model_stale_days = live_cfg["model_stale_days"]
         self.model_dir = Path(live_cfg["model_dir"])
         self.state_snapshot_path = Path(live_cfg["state_snapshot_path"])
         self.max_market_wait_seconds = live_cfg["max_market_wait_seconds"]
-        self.dashboard_refresh_seconds = config["monitoring"]["dashboard_refresh_seconds"]
+        self.dashboard_refresh_seconds = monitoring_cfg["dashboard_refresh_seconds"]
+        self.large_pnl_threshold_pct = monitoring_cfg["large_pnl_threshold_pct"]
         self.strategy_config = build_strategy_template(config).config
+
+        self.structured_logger = structured_logger or StructuredLogger(log_dir=monitoring_cfg["log_dir"])
+        self.alert_manager = alert_manager or AlertManager(rate_limit_minutes=monitoring_cfg["alert_rate_limit_minutes"])
+        self.dashboard = dashboard or Dashboard(refresh_seconds=self.dashboard_refresh_seconds)
 
         self.feature_engineer = FeatureEngineer()
         self.engines: dict[str, HMMEngine] = {}
@@ -294,6 +318,8 @@ class TradingSession:
         self._last_regime_date: dict[str, date] = {}
         self._last_regime_state: dict[str, object] = {}
         self._last_bar_at: dict[str, datetime] = {}
+        self._data_feed_alerted: set[str] = set()
+        self._last_leverage: dict[str, float] = {}
         self._last_dashboard_refresh = 0.0
         self._session_started_at = datetime.now(timezone.utc)
         self._running = False
@@ -373,6 +399,10 @@ class TradingSession:
         engine.save_model(self.model_dir / f"{symbol}_hmm.pkl")
         self.hmm_last_trained[symbol] = engine.training_metadata["training_date"]
         logger.info("Trained HMM for %s: n_regimes=%d labels=%s", symbol, engine.n_regimes, engine.state_labels)
+        self.structured_logger.log_info(
+            "hmm_trained", symbol=symbol, n_regimes=engine.n_regimes, labels=engine.state_labels
+        )
+        self.alert_manager.alert_hmm_retrained(symbol, engine.n_regimes)
         return engine
 
     def retrain_if_due(self, symbol: str, bars: pd.DataFrame) -> None:
@@ -413,8 +443,14 @@ class TradingSession:
                     )
 
             self._housekeeping_tick(symbol)
-        except Exception:
+        except Exception as exc:
             logger.critical("ALERT: unhandled error processing bar for %s", symbol, exc_info=True)
+            self.structured_logger.log_error(f"unhandled error processing bar for {symbol}", exc)
+            self.alert_manager.send_alert(
+                f"Unhandled error processing bar for {symbol}: {exc}",
+                AlertSeverity.CRITICAL,
+                alert_key=f"unhandled_error:{symbol}",
+            )
             self._save_state_snapshot()
 
     def _process_new_trading_day(self, symbol: str) -> None:
@@ -428,10 +464,23 @@ class TradingSession:
             return
 
         engine = self.engines[symbol]
+        previous_regime_state = self._last_regime_state.get(symbol)
         regime_state = engine.predict_regime_filtered(features)[-1]
         is_flickering = engine.is_flickering()
         self._last_regime_state[symbol] = regime_state
         self.position_tracker.update_current_regime(symbol, regime_state.label)
+        self.structured_logger.set_context(
+            regime=regime_state.label, probability=regime_state.probability, equity=None, positions=None, daily_pnl=None
+        )
+
+        if previous_regime_state is not None and previous_regime_state.label != regime_state.label:
+            self.structured_logger.log_regime_change(symbol, previous_regime_state.label, regime_state.label)
+            self.alert_manager.alert_regime_change(symbol, previous_regime_state.label, regime_state.label)
+
+        if is_flickering:
+            self.alert_manager.alert_flicker_exceeded(
+                symbol, engine.get_regime_flicker_rate(), engine.flicker_threshold
+            )
 
         orchestrator = self.orchestrators[symbol]
         signals = orchestrator.generate_signals([symbol], {symbol: bars}, regime_state, is_flickering)
@@ -439,11 +488,16 @@ class TradingSession:
             self.process_signal(symbol, sig)
 
         self.update_trailing_stop(symbol, bars)
+        self._check_large_pnl(symbol)
 
     def process_signal(self, symbol: str, sig: StrategySignal) -> None:
         if self._is_data_feed_stale(symbol):
             logger.warning("Data feed for %s looks stale; pausing new signals (existing stops untouched).", symbol)
+            if symbol not in self._data_feed_alerted:
+                self.alert_manager.alert_data_feed_down(symbol)
+                self._data_feed_alerted.add(symbol)
             return
+        self._data_feed_alerted.discard(symbol)
 
         portfolio_state = self.position_tracker.get_portfolio_state()
         decision = self.risk_manager.validate_signal(sig, portfolio_state)
@@ -453,6 +507,13 @@ class TradingSession:
             return
         if decision.modifications:
             logger.info("Signal for %s modified by risk manager: %s", symbol, decision.modifications)
+
+        signal_desc = (
+            f"{decision.modified_signal.direction} {decision.modified_signal.position_size_pct:.0%} "
+            f"({sig.regime_name})"
+        )
+        self.dashboard.record_signal(datetime.now(timezone.utc).strftime("%H:%M"), symbol, signal_desc)
+        self._last_leverage[symbol] = decision.modified_signal.leverage
 
         if self.dry_run:
             logger.info(
@@ -469,6 +530,17 @@ class TradingSession:
         try:
             result = self.order_executor.submit_bracket_order(decision.modified_signal, trade_id=trade_id)
             logger.info("Order submitted for %s (trade_id=%s): status=%s", symbol, trade_id, result.status)
+            self.structured_logger.log_trade(
+                symbol,
+                decision.modified_signal.direction,
+                {
+                    "trade_id": trade_id,
+                    "status": result.status,
+                    "position_size_pct": decision.modified_signal.position_size_pct,
+                    "leverage": decision.modified_signal.leverage,
+                    "modifications": decision.modifications,
+                },
+            )
         except Exception:
             logger.exception("Order submission failed for %s", symbol)
 
@@ -497,6 +569,16 @@ class TradingSession:
             portfolio_state, regime_label=regime_state.label if regime_state else None
         )
 
+        for breaker_type, drawdown_pct, was_active, is_active in (
+            ("daily_reduce", -portfolio_state.daily_pnl_pct, previous.daily_reduce_active, new_state.daily_reduce_active),
+            ("daily_halt", -portfolio_state.daily_pnl_pct, previous.daily_halt_active, new_state.daily_halt_active),
+            ("weekly_reduce", -portfolio_state.weekly_pnl_pct, previous.weekly_reduce_active, new_state.weekly_reduce_active),
+            ("weekly_halt", -portfolio_state.weekly_pnl_pct, previous.weekly_halt_active, new_state.weekly_halt_active),
+            ("peak_halt", -portfolio_state.drawdown_from_peak_pct, previous.peak_halt_active, new_state.peak_halt_active),
+        ):
+            if is_active and not was_active:
+                self.alert_manager.alert_circuit_breaker(breaker_type, drawdown_pct)
+
         newly_halted = (new_state.daily_halt_active and not previous.daily_halt_active) or (
             new_state.weekly_halt_active and not previous.weekly_halt_active
         )
@@ -504,6 +586,13 @@ class TradingSession:
             logger.warning("Circuit breaker halt triggered — closing all positions.")
             if not self.dry_run:
                 self.order_executor.close_all_positions()
+
+    def _check_large_pnl(self, symbol: str) -> None:
+        position = self.position_tracker.get_position(symbol)
+        if position is None:
+            return
+        if abs(position.unrealized_pnl_pct) >= self.large_pnl_threshold_pct:
+            self.alert_manager.alert_large_pnl(symbol, position.unrealized_pnl_pct, self.large_pnl_threshold_pct)
 
     def _is_data_feed_stale(self, symbol: str) -> bool:
         last_bar_at = self._last_bar_at.get(symbol)
@@ -528,36 +617,76 @@ class TradingSession:
         self._last_dashboard_refresh = now
         self.render_dashboard()
 
-    def render_dashboard(self, console: Optional[Console] = None) -> None:
-        console = console or Console()
+    def _mode_label(self) -> str:
+        return "DRY RUN" if self.dry_run else ("PAPER" if self.client.paper else "LIVE")
+
+    def _build_dashboard_state(self) -> dict[str, Any]:
         portfolio_state = self.position_tracker.get_portfolio_state()
 
-        summary = Table(title="regime-trader — live status")
-        summary.add_column("Metric")
-        summary.add_column("Value", justify="right")
-        summary.add_row("Mode", "DRY RUN" if self.dry_run else ("PAPER" if self.client.paper else "LIVE"))
-        summary.add_row("Equity", f"${portfolio_state.equity:,.2f}")
-        summary.add_row("Daily P&L", f"{portfolio_state.daily_pnl_pct:.2%}")
-        summary.add_row("Weekly P&L", f"{portfolio_state.weekly_pnl_pct:.2%}")
-        summary.add_row("Drawdown from Peak", f"{portfolio_state.drawdown_from_peak_pct:.2%}")
-        summary.add_row("Circuit Breaker", "HALTED" if portfolio_state.circuit_breaker_status.trading_halted else "normal")
-        summary.add_row("Open Positions", str(len(portfolio_state.positions)))
-        console.print(summary)
+        regimes = {}
+        for symbol, regime_state in self._last_regime_state.items():
+            engine = self.engines.get(symbol)
+            regimes[symbol] = {
+                "label": regime_state.label,
+                "probability": regime_state.probability,
+                "consecutive_bars": regime_state.consecutive_bars,
+                "flicker_rate": engine.get_regime_flicker_rate() if engine else 0,
+                "flicker_window": engine.flicker_window if engine else 0,
+            }
 
-        if self.position_tracker.positions:
-            positions_table = Table(title="Open Positions")
-            for col in ("Symbol", "Qty", "Entry", "Current", "Unrealized P&L", "Regime (entry -> now)"):
-                positions_table.add_column(col)
-            for symbol, tracked in self.position_tracker.positions.items():
-                positions_table.add_row(
-                    symbol,
-                    f"{tracked.quantity:g}",
-                    f"{tracked.entry_price:.2f}",
-                    f"{tracked.current_price:.2f}",
-                    f"{tracked.unrealized_pnl_pct:.2%}",
-                    f"{tracked.regime_at_entry} -> {tracked.regime_current}",
-                )
-            console.print(positions_table)
+        daily_start = self.position_tracker._daily_start_equity or portfolio_state.equity
+        positions = [
+            {
+                "symbol": symbol,
+                "direction": "LONG",
+                "current_price": p.current_price,
+                "unrealized_pnl_pct": p.unrealized_pnl_pct,
+                "stop_level": p.stop_level,
+                "holding_period": _format_timedelta(p.holding_period()),
+            }
+            for symbol, p in self.position_tracker.positions.items()
+        ]
+
+        api_ok, api_latency_ms = self._check_api_health()
+        hmm_age = _format_hmm_age(self.hmm_last_trained)
+
+        return {
+            "regimes": regimes,
+            "portfolio": {
+                "equity": portfolio_state.equity,
+                "daily_pnl": portfolio_state.equity - daily_start,
+                "daily_pnl_pct": portfolio_state.daily_pnl_pct,
+                "allocation_pct": self.position_tracker.get_total_exposure(portfolio_state.equity),
+                "leverage": max(self._last_leverage.values()) if self._last_leverage else 1.0,
+            },
+            "positions": positions,
+            "risk": {
+                "daily_dd_pct": max(0.0, -portfolio_state.daily_pnl_pct),
+                "daily_dd_halt": self.risk_manager.config.daily_dd_halt,
+                "peak_dd_pct": max(0.0, -portfolio_state.drawdown_from_peak_pct),
+                "max_dd_from_peak": self.risk_manager.config.max_dd_from_peak,
+            },
+            "system": {
+                "data_feed_ok": not self._data_feed_alerted,
+                "api_ok": api_ok,
+                "api_latency_ms": api_latency_ms,
+                "hmm_age": hmm_age,
+                "mode": self._mode_label(),
+            },
+        }
+
+    def _check_api_health(self) -> tuple[bool, Optional[float]]:
+        start = time.monotonic()
+        try:
+            self.client.get_clock()
+        except Exception:
+            self.alert_manager.alert_api_lost()
+            return False, None
+        return True, (time.monotonic() - start) * 1000
+
+    def render_dashboard(self, console: Optional[Console] = None) -> None:
+        console = console or self.dashboard.console
+        console.print(self.dashboard.render(self._build_dashboard_state()))
 
     # ------------------------------------------------------------------
     # State persistence (crash recovery + `dashboard` subcommand)
@@ -695,6 +824,23 @@ def _timeframe_to_timedelta(timeframe: str) -> timedelta:
     raise ValueError(f"Unrecognized timeframe: {timeframe!r}")
 
 
+def _format_timedelta(delta: timedelta) -> str:
+    total_seconds = int(delta.total_seconds())
+    if total_seconds < 3600:
+        return f"{max(0, total_seconds // 60)}m"
+    if total_seconds < 86400:
+        return f"{total_seconds // 3600}h"
+    return f"{total_seconds // 86400}d"
+
+
+def _format_hmm_age(hmm_last_trained: dict[str, datetime]) -> str:
+    if not hmm_last_trained:
+        return "n/a"
+    oldest = min(hmm_last_trained.values())
+    age_days = (datetime.now(timezone.utc) - oldest).days
+    return "today" if age_days <= 0 else f"{age_days}d ago"
+
+
 def build_trading_session(config: dict, symbols: list[str], dry_run: bool = False, max_retries: int = 3) -> TradingSession:
     """Construct and wire together all live-trading components."""
     api_key = os.environ.get("ALPACA_API_KEY")
@@ -712,8 +858,30 @@ def build_trading_session(config: dict, symbols: list[str], dry_run: bool = Fals
     risk_manager = build_risk_manager(config)
     position_tracker = PositionTracker(client, circuit_breaker=risk_manager.circuit_breaker)
 
+    monitoring_cfg = config["monitoring"]
+    structured_logger = StructuredLogger(log_dir=monitoring_cfg["log_dir"])
+    credentials = load_credentials()
+    alerts_cfg = credentials.get("alerts", {})
+    alert_manager = AlertManager(
+        email_config=alerts_cfg.get("email"),
+        webhook_config=alerts_cfg.get("webhook"),
+        rate_limit_minutes=monitoring_cfg["alert_rate_limit_minutes"],
+        structured_logger=structured_logger,
+    )
+    dashboard = Dashboard(refresh_seconds=monitoring_cfg["dashboard_refresh_seconds"])
+
     return TradingSession(
-        config, client, market_data, order_executor, position_tracker, risk_manager, symbols, dry_run=dry_run
+        config,
+        client,
+        market_data,
+        order_executor,
+        position_tracker,
+        risk_manager,
+        symbols,
+        dry_run=dry_run,
+        structured_logger=structured_logger,
+        alert_manager=alert_manager,
+        dashboard=dashboard,
     )
 
 

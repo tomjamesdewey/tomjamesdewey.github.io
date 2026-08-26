@@ -78,4 +78,6 @@ backtest:
 
 monitoring:
   dashboard_refresh_seconds: 5    # Terminal dashboard refresh interval
-  alert_rate_limit_minutes: 15    # Minimum minutes between repeated alerts
+  alert_rate_limit_minutes: 15    # Minimum minutes between repeated alerts of the same type
+  log_dir: logs                   # Directory for main.log/trades.log/alerts.log/regime.log
+  large_pnl_threshold_pct: 0.05   # Unrealized P&L magnitude that triggers a "large P&L" alert
