@@ -7,12 +7,18 @@ import pandas as pd
 import pytest
 
 from core.hmm_engine import HMMEngine
+from core.regime_strategies import StrategyConfig, StrategyOrchestrator
 from data.feature_engineering import FeatureEngineer
 
 # Kept small so HMM fitting stays fast in tests; still >= a full
 # standardization window (252) + SMA-200 warm-up so build_feature_set
 # yields plenty of valid rows.
 N_BARS = 900
+
+# A full walk-forward run needs >= warm-up (~452 raw bars) + train_window
+# (252) + test_window (126) valid feature rows for even one window; this
+# gives a few windows' worth of walk-forward coverage.
+N_WALKFORWARD_BARS = 1300
 
 #: Fast-fitting HMM config shared by tests that don't care about the exact
 #: production settings.yaml values.
@@ -24,6 +30,22 @@ TEST_HMM_KWARGS = dict(
     stability_bars=3,
     flicker_window=20,
     flicker_threshold=4,
+    min_confidence=0.55,
+)
+
+#: Fast-fitting walk-forward window sizes, smaller than settings.yaml's
+#: production 252/126/126 so tests stay quick.
+TEST_WALKFORWARD_KWARGS = dict(train_window=252, test_window=126, step_size=126)
+
+#: Mirrors the ``strategy`` section of settings.yaml.
+TEST_STRATEGY_CONFIG = StrategyConfig(
+    low_vol_allocation=0.95,
+    mid_vol_allocation_trend=0.95,
+    mid_vol_allocation_no_trend=0.60,
+    high_vol_allocation=0.60,
+    low_vol_leverage=1.25,
+    rebalance_threshold=0.10,
+    uncertainty_size_mult=0.50,
     min_confidence=0.55,
 )
 
@@ -83,3 +105,34 @@ def fresh_inference_copy(engine: HMMEngine) -> HMMEngine:
     clone.state_labels = engine.state_labels
     clone.regime_info = engine.regime_info
     return clone
+
+
+@pytest.fixture(scope="session")
+def walkforward_bars() -> pd.DataFrame:
+    return make_synthetic_bars(n_bars=N_WALKFORWARD_BARS, seed=7)
+
+
+def make_backtester(hmm_kwargs: dict | None = None, walkforward_kwargs: dict | None = None):
+    from backtest.backtester import Backtester
+
+    hmm_template = HMMEngine(**(hmm_kwargs or TEST_HMM_KWARGS))
+    strategy_template = StrategyOrchestrator(TEST_STRATEGY_CONFIG, {})
+    windows = walkforward_kwargs or TEST_WALKFORWARD_KWARGS
+    return Backtester(
+        hmm_template,
+        strategy_template,
+        None,
+        initial_capital=100_000.0,
+        slippage_pct=0.0005,
+        **windows,
+    )
+
+
+@pytest.fixture(scope="session")
+def backtester():
+    return make_backtester()
+
+
+@pytest.fixture(scope="session")
+def walkforward_result(backtester, walkforward_bars: pd.DataFrame):
+    return backtester.run({"TEST": walkforward_bars})
