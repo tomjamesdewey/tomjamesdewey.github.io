@@ -1,0 +1,14 @@
+# Secrets
+.env
+config/credentials.yaml
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# OS
+.DS_Store

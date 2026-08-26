@@ -1,0 +1,13 @@
+hmmlearn
+alpaca-trade-api
+alpaca-py
+pandas
+numpy
+scipy
+ta
+scikit-learn
+pyyaml
+python-dotenv
+websocket-client
+schedule
+rich
